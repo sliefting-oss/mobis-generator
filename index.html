@@ -1,0 +1,82 @@
+import Anthropic from '@anthropic-ai/sdk';
+
+const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') return res.status(405).end();
+
+  const { quarter, year, selectedDeals, currentCount, prevCount } = req.body;
+  const change = currentCount - prevCount;
+  const pct = prevCount ? Math.round(change / prevCount * 100) : 0;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
+  const send = (type, data) => res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+
+  const dealsList = selectedDeals
+    .map(d => `- ${d.target} (${d.segment}): ${d.type} by ${d.acquirer}${d.amount ? ' — ' + d.amount : ''}`)
+    .join('\n');
+
+  const prompt = `You are a senior analyst at Mobis Corporate Finance, a Dutch M&A advisory firm specialised in the bike and micromobility industry.
+
+Generate quarterly market update content for ${quarter} ${year}.
+
+Transaction statistics:
+- Total transactions this period: ${currentCount}
+- Same period last year: ${prevCount}
+- Change: ${change > 0 ? '+' : ''}${change} (${pct > 0 ? '+' : ''}${pct}% YoY)
+
+Highlighted transactions:
+${dealsList || 'No deals selected.'}
+
+Generate:
+1. KEY TAKEAWAYS — exactly 4 bullet points. Each 2-3 sentences. Professional Mobis tone. Bold the key phrase at the start of each. Cover: market trend, investor landscape, deal themes, outlook.
+2. SECTOR NEWS HIGHLIGHTS — 3-4 sentences on broader sector developments this quarter.
+3. DEAL COMMENTARY — 2-3 sentences contextualising the highlighted transactions.
+
+Format EXACTLY:
+TAKEAWAYS:
+[content]
+---
+SECTOR_NEWS:
+[content]
+---
+DEAL_COMMENTARY:
+[content]`;
+
+  try {
+    const stream = await client.messages.stream({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1200,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    let fullText = '';
+    for await (const chunk of stream.textStream) {
+      fullText += chunk;
+      send('chunk', { text: chunk });
+    }
+
+    const extract = (t, start, end) => {
+      const s = t.indexOf(start);
+      if (s === -1) return '';
+      const after = t.slice(s + start.length);
+      if (!end) return after.trim();
+      const e = after.indexOf(end);
+      return (e === -1 ? after : after.slice(0, e)).trim();
+    };
+
+    send('done', {
+      takeaways: extract(fullText, 'TAKEAWAYS:', '---'),
+      sectorNews: extract(fullText, 'SECTOR_NEWS:', '---'),
+      dealComm: extract(fullText, 'DEAL_COMMENTARY:', null)
+    });
+  } catch (err) {
+    send('error', { msg: err.message });
+  }
+
+  res.end();
+}
